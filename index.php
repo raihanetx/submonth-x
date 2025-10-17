@@ -45,46 +45,74 @@ $hot_deals_speed = $site_config['hot_deals_speed'] ?? 40;
 $payment_methods = $site_config['payment_methods'] ?? [];
 
 // --- Prepare Data for Vue.js ---
-$all_categories = [];
 $all_products_flat = [];
 $products_by_category = [];
 $product_slug_map = [];
 $category_slug_map = [];
 $static_pages = ['cart', 'checkout', 'order-history', 'products', 'about-us', 'privacy-policy', 'terms-and-conditions', 'refund-policy'];
 
-$categories = $pdo->query("SELECT id, name, slug, icon FROM categories ORDER BY name ASC")->fetchAll(PDO::FETCH_ASSOC);
-foreach ($categories as $category) {
-    $all_categories[] = ['name' => $category['name'], 'slug' => $category['slug'], 'icon' => $category['icon']];
-    $category_slug_map[$category['slug']] = $category['name'];
+// Optimized Data Fetching
+// 1. Get all categories
+$categories_raw = $pdo->query("SELECT id, name, slug, icon FROM categories ORDER BY name ASC")->fetchAll(PDO::FETCH_ASSOC);
+$all_categories = array_map(function($c) { return ['name' => $c['name'], 'slug' => $c['slug'], 'icon' => $c['icon']]; }, $categories_raw);
+$category_slug_map = array_column($categories_raw, 'name', 'slug');
 
-    $product_stmt = $pdo->prepare("SELECT * FROM products WHERE category_id = ? ORDER BY name ASC");
-    $product_stmt->execute([$category['id']]);
-    $products_for_this_category = $product_stmt->fetchAll(PDO::FETCH_ASSOC);
+// 2. Get all products with category info joined
+$products_query = "
+    SELECT
+        p.*,
+        c.name as category,
+        c.slug as category_slug
+    FROM products p
+    JOIN categories c ON p.category_id = c.id
+    ORDER BY c.name ASC, p.name ASC
+";
+$all_products_raw = $pdo->query($products_query)->fetchAll(PDO::FETCH_ASSOC);
+$product_ids = array_column($all_products_raw, 'id');
 
-    $category_products_temp = [];
-    foreach ($products_for_this_category as $product) {
-        $product_data = $product;
-        $product_data['stock_out'] = (bool)$product_data['stock_out'];
-        $product_data['featured'] = (bool)$product_data['featured'];
-        $product_data['category'] = $category['name'];
-        $product_data['category_slug'] = $category['slug'];
+$all_pricing = [];
+$all_reviews = [];
 
-        $pricing_stmt = $pdo->prepare("SELECT duration, price FROM product_pricing WHERE product_id = ?");
-        $pricing_stmt->execute([$product['id']]);
-        $product_data['pricing'] = $pricing_stmt->fetchAll(PDO::FETCH_ASSOC);
+if (!empty($product_ids)) {
+    // 3. Get all pricing for all products in one query
+    $in_placeholders = implode(',', array_fill(0, count($product_ids), '?'));
 
-        $reviews_stmt = $pdo->prepare("SELECT id, name, rating, comment FROM product_reviews WHERE product_id = ? ORDER BY created_at DESC");
-        $reviews_stmt->execute([$product['id']]);
-        $product_data['reviews'] = $reviews_stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        $all_products_flat[] = $product_data;
-        $category_products_temp[] = $product_data;
-        $product_slug_map[$category['slug'] . '/' . $product['slug']] = $product['id'];
+    $pricing_stmt = $pdo->prepare("SELECT * FROM product_pricing WHERE product_id IN ($in_placeholders)");
+    $pricing_stmt->execute($product_ids);
+    $all_pricing_raw = $pricing_stmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($all_pricing_raw as $p) {
+        $all_pricing[$p['product_id']][] = ['duration' => $p['duration'], 'price' => $p['price']];
     }
 
-    if (!empty($category_products_temp)) {
-        $products_by_category[$category['name']] = $category_products_temp;
+    // 4. Get all reviews for all products in one query
+    $reviews_stmt = $pdo->prepare("SELECT * FROM product_reviews WHERE product_id IN ($in_placeholders) ORDER BY created_at DESC");
+    $reviews_stmt->execute($product_ids);
+    $all_reviews_raw = $reviews_stmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($all_reviews_raw as $r) {
+        $all_reviews[$r['product_id']][] = ['id' => $r['id'], 'name' => $r['name'], 'rating' => $r['rating'], 'comment' => $r['comment']];
     }
+}
+
+// 5. Combine data in PHP
+foreach ($all_products_raw as $product) {
+    $product_id = $product['id'];
+    $product_data = $product;
+
+    $product_data['stock_out'] = (bool)$product['stock_out'];
+    $product_data['featured'] = (bool)$product['featured'];
+
+    $product_data['pricing'] = $all_pricing[$product_id] ?? [];
+    if (empty($product_data['pricing'])) {
+        // If a product has no pricing information, provide a default to prevent frontend errors.
+        // This ensures the application remains stable, though such products may need attention.
+        $product_data['pricing'] = [['duration' => 'Default', 'price' => '0.00']];
+    }
+
+    $product_data['reviews'] = $all_reviews[$product_id] ?? [];
+
+    $all_products_flat[] = $product_data;
+    $products_by_category[$product['category']][] = $product_data;
+    $product_slug_map[$product['category_slug'] . '/' . $product['slug']] = $product_id;
 }
 
 // --- URL ROUTING LOGIC ---
@@ -850,7 +878,6 @@ if ($request_path) {
                 <div v-if="currentView === 'aboutUs'" class="bg-white min-h-screen">
                     <div class="container mx-auto max-w-4xl p-6 md:p-12">
                         <div class="space-y-8">
-                            <h1 class="text-3xl md:text-4xl font-bold text-gray-800 text-center border-b pb-4">About Us</h1>
                             <div class="text-gray-700 leading-relaxed" v-html="formattedPageContent"></div>
                         </div>
                     </div>
@@ -858,7 +885,6 @@ if ($request_path) {
                 <div v-if="currentView === 'termsAndConditions'" class="bg-white min-h-screen">
                     <div class="container mx-auto max-w-4xl p-6 md:p-12">
                         <div class="space-y-8">
-                            <h1 class="text-3xl md:text-4xl font-bold text-gray-800 text-center border-b pb-4">Terms and Conditions</h1>
                             <div class="text-gray-700 leading-relaxed" v-html="formattedPageContent"></div>
                         </div>
                     </div>
@@ -866,7 +892,6 @@ if ($request_path) {
                 <div v-if="currentView === 'privacyPolicy'" class="bg-white min-h-screen">
                     <div class="container mx-auto max-w-4xl p-6 md:p-12">
                         <div class="space-y-8">
-                            <h1 class="text-3xl md:text-4xl font-bold text-gray-800 text-center border-b pb-4">Privacy Policy</h1>
                             <div class="text-gray-700 leading-relaxed" v-html="formattedPageContent"></div>
                         </div>
                     </div>
@@ -874,7 +899,6 @@ if ($request_path) {
                 <div v-if="currentView === 'refundPolicy'" class="bg-white min-h-screen">
                     <div class="container mx-auto max-w-4xl p-6 md:p-12">
                         <div class="space-y-8">
-                            <h1 class="text-3xl md:text-4xl font-bold text-gray-800 text-center border-b pb-4">Refund Policy</h1>
                             <div class="text-gray-700 leading-relaxed" v-html="formattedPageContent"></div>
                         </div>
                     </div>
